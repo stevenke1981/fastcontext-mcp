@@ -46,6 +46,12 @@ struct ExploreArgs {
     timeout_secs: Option<u64>,
     /// Ask FastContext CLI to print intermediate messages.
     verbose: Option<bool>,
+    /// Override BASE_URL for this request (e.g. http://127.0.0.1:30000/v1).
+    base_url: Option<String>,
+    /// Override MODEL for this request (e.g. microsoft/FastContext-1.0-4B-RL).
+    model: Option<String>,
+    /// Override API_KEY for this request.
+    api_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +138,7 @@ fn write_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn tools_list_result() -> Value {
+fn tools_list_result(_config: &Config) -> Value {
     json!({
         "tools": [
             {
@@ -174,9 +180,31 @@ fn tools_list_result() -> Value {
                         "verbose": {
                             "type": "boolean",
                             "default": false
+                        },
+                        "base_url": {
+                            "type": "string",
+                            "description": "Override BASE_URL for this request, e.g. http://127.0.0.1:30000/v1"
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Override MODEL for this request, e.g. microsoft/FastContext-1.0-4B-RL"
+                        },
+                        "api_key": {
+                            "type": "string",
+                            "description": "Override API_KEY for this request"
                         }
                     },
                     "required": ["query"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "fastcontext_status",
+                "description": "Check the MCP server configuration and fastcontext CLI availability. Read-only diagnostic tool.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
                     "additionalProperties": false
                 }
             }
@@ -198,6 +226,55 @@ fn validate_relative_path(path: &str) -> Result<PathBuf> {
         }
     }
     Ok(p)
+}
+
+/// Check if the fastcontext binary is available on PATH.
+fn check_fastcontext_binary(name: &str) -> (bool, String) {
+    match std::process::Command::new(name).arg("--help").output() {
+        Ok(_) => (true, "found at PATH or cwd".to_string()),
+        Err(e) => (false, format!("{e}")),
+    }
+}
+
+/// Build a server status report string (used by fastcontext_status tool
+/// and startup diagnostics).
+fn server_status_text(config: &Config) -> String {
+    let (bin_ok, bin_detail) = check_fastcontext_binary(&config.fastcontext_bin);
+
+    let base_url = env::var("BASE_URL").ok();
+    let model = env::var("MODEL").ok();
+    let api_key_set = env::var("API_KEY").ok().map(|v| !v.is_empty());
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "server:     {} v{}",
+        SERVER_NAME,
+        env!("CARGO_PKG_VERSION")
+    ));
+    lines.push(format!(
+        "binary:     {} {}",
+        config.fastcontext_bin,
+        if bin_ok { "✓" } else { "✗ NOT FOUND" }
+    ));
+    lines.push(format!("binary_detail: {}", bin_detail));
+    lines.push(format!("work_dir:   {}", config.default_work_dir.display()));
+    lines.push(format!("allowed_root: {}", config.allowed_root.display()));
+    lines.push(format!("max_turns:  {}", config.default_max_turns));
+    lines.push(format!("timeout:    {}s", config.default_timeout_secs));
+    match base_url {
+        Some(ref u) => lines.push(format!("BASE_URL:   {}", u)),
+        None => lines.push("BASE_URL:   (not set) ⚠".to_string()),
+    }
+    match model {
+        Some(ref m) => lines.push(format!("MODEL:      {}", m)),
+        None => lines.push("MODEL:      (not set) ⚠".to_string()),
+    }
+    match api_key_set {
+        Some(true) => lines.push("API_KEY:    ✓ (set)".to_string()),
+        Some(false) => lines.push("API_KEY:    (empty) ⚠".to_string()),
+        None => lines.push("API_KEY:    (not set) — OK for local servers".to_string()),
+    }
+    lines.join("\n")
 }
 
 fn truncate_for_error(text: &[u8], max: usize) -> String {
@@ -267,6 +344,24 @@ async fn run_fastcontext_async(config: &Config, args: ExploreArgs) -> Result<Str
         cmd.arg("--verbose");
     }
 
+    // Pass per-request endpoint overrides as environment variables.
+    // fastcontext CLI reads BASE_URL, MODEL, API_KEY from its own environment.
+    if let Some(ref url) = args.base_url {
+        if !url.is_empty() {
+            cmd.env("BASE_URL", url);
+        }
+    }
+    if let Some(ref model) = args.model {
+        if !model.is_empty() {
+            cmd.env("MODEL", model);
+        }
+    }
+    if let Some(ref key) = args.api_key {
+        if !key.is_empty() {
+            cmd.env("API_KEY", key);
+        }
+    }
+
     let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
         .await
         .map_err(|_| anyhow!("fastcontext timed out after {timeout_secs}s"))?
@@ -319,9 +414,27 @@ fn handle_tools_call(config: &Config, params: Option<Value>) -> Value {
             match run_fastcontext(config, args) {
                 Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
                 Err(err) => {
-                    json!({"content": [{"type": "text", "text": err.to_string()}], "isError": true})
+                    let msg = err.to_string();
+                    // Improve error message for common "binary not found" case
+                    let enriched = if msg.contains("program not found")
+                        || msg.contains("program not found")
+                        || msg.contains("No such file")
+                        || msg.to_lowercase().contains("cannot find")
+                    {
+                        format!(
+                            "{}\n\nHint: Install fastcontext CLI: uv tool install . from https://github.com/microsoft/fastcontext\nOr set FASTCONTEXT_BIN env var to the correct path.",
+                            msg
+                        )
+                    } else {
+                        msg
+                    };
+                    json!({"content": [{"type": "text", "text": enriched}], "isError": true})
                 }
             }
+        }
+        "fastcontext_status" => {
+            let report = server_status_text(config);
+            json!({"content": [{"type": "text", "text": report}], "isError": false})
         }
         other => json!({
             "content": [{"type": "text", "text": format!("unknown tool: {other}")}],
@@ -352,7 +465,7 @@ fn handle_request(config: &Config, req: JsonRpcRequest) -> Option<Value> {
                 "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")}
             })
         }
-        "tools/list" => tools_list_result(),
+        "tools/list" => tools_list_result(config),
         "tools/call" => handle_tools_call(config, req.params),
         "ping" => json!({}),
         _ => {
@@ -371,12 +484,33 @@ fn main() -> Result<()> {
     let config = Config::from_env()?;
     let stdin = io::stdin();
 
-    eprintln!(
-        "{SERVER_NAME} started. fastcontext_bin={}, work_dir={}, allowed_root={}",
-        config.fastcontext_bin,
-        config.default_work_dir.display(),
-        config.allowed_root.display()
-    );
+    // Startup diagnostics
+    let (bin_ok, bin_detail) = check_fastcontext_binary(&config.fastcontext_bin);
+    let bin_status = if bin_ok { "✓" } else { "✗ NOT FOUND" };
+    let base_url_status = match env::var("BASE_URL") {
+        Ok(ref u) if !u.is_empty() => format!("✓ ({u})"),
+        _ => "⚠ NOT SET — fastcontext will fail".to_string(),
+    };
+    let model_status = match env::var("MODEL") {
+        Ok(ref m) if !m.is_empty() => format!("✓ ({m})"),
+        _ => "⚠ NOT SET — fastcontext will fail".to_string(),
+    };
+
+    eprintln!("{SERVER_NAME} v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("  binary:     {} {}", config.fastcontext_bin, bin_status);
+    if !bin_ok {
+        eprintln!("  binary_detail: {}", bin_detail);
+        eprintln!("  HINT: Install fastcontext CLI or set FASTCONTEXT_BIN");
+    }
+    eprintln!("  BASE_URL:   {}", base_url_status);
+    eprintln!("  MODEL:      {}", model_status);
+    eprintln!("  work_dir:   {}", config.default_work_dir.display());
+    eprintln!("  allowed:    {}", config.allowed_root.display());
+    eprintln!("  max_turns:  {}", config.default_max_turns);
+    eprintln!("  timeout:    {}s", config.default_timeout_secs);
+    if !bin_ok {
+        eprintln!("WARNING: fastcontext binary not found. Tool calls will fail until installed.");
+    }
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -486,13 +620,15 @@ mod tests {
 
     #[test]
     fn test_tools_list_has_tools_key() {
-        let result = tools_list_result();
+        let cfg = test_config();
+        let result = tools_list_result(&cfg);
         assert!(result.get("tools").is_some());
     }
 
     #[test]
     fn test_tools_list_contains_fastcontext_explore() {
-        let result = tools_list_result();
+        let cfg = test_config();
+        let result = tools_list_result(&cfg);
         let tools = result["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"fastcontext_explore"));
@@ -500,11 +636,21 @@ mod tests {
 
     #[test]
     fn test_tools_list_input_schema_has_query_required() {
-        let result = tools_list_result();
+        let cfg = test_config();
+        let result = tools_list_result(&cfg);
         let tool = &result["tools"][0];
         let schema = &tool["inputSchema"];
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("query")));
+    }
+
+    #[test]
+    fn test_tools_list_contains_fastcontext_status() {
+        let cfg = test_config();
+        let result = tools_list_result(&cfg);
+        let tools = result["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"fastcontext_status"));
     }
 
     // -- response / error_response --
@@ -551,13 +697,19 @@ mod tests {
             "citation": false,
             "trajectory_file": "traj.jsonl",
             "timeout_secs": 120,
-            "verbose": true
+            "verbose": true,
+            "base_url": "http://localhost:8080/v1",
+            "model": "my-model",
+            "api_key": "sk-test"
         });
         let args: ExploreArgs = serde_json::from_value(json).unwrap();
         assert_eq!(args.query, "find routes");
         assert_eq!(args.work_dir.unwrap(), "/repo");
         assert_eq!(args.max_turns.unwrap(), 10);
         assert!(!args.citation.unwrap());
+        assert_eq!(args.base_url.unwrap(), "http://localhost:8080/v1");
+        assert_eq!(args.model.unwrap(), "my-model");
+        assert_eq!(args.api_key.unwrap(), "sk-test");
     }
 
     #[test]
@@ -658,6 +810,35 @@ mod tests {
     }
 
     // -- Config::resolve_work_dir --
+
+    // -- server_status_text --
+
+    #[test]
+    fn test_server_status_text_includes_server_name() {
+        let cfg = test_config();
+        let report = server_status_text(&cfg);
+        assert!(report.contains("fastcontext-mcp-rust"));
+        assert!(report.contains("BASE_URL"));
+        assert!(report.contains("MODEL"));
+        assert!(report.contains("binary"));
+    }
+
+    #[test]
+    fn test_server_status_text_contains_config_values() {
+        let cfg = test_config();
+        let report = server_status_text(&cfg);
+        assert!(report.contains("fastcontext")); // binary name
+        assert!(report.contains("max_turns"));
+        assert!(report.contains("timeout"));
+    }
+
+    // -- check_fastcontext_binary --
+
+    #[test]
+    fn test_check_binary_nonexistent_returns_false() {
+        let (found, _detail) = check_fastcontext_binary("this-binary-does-not-exist-hopefully");
+        assert!(!found);
+    }
 
     #[test]
     fn test_resolve_work_dir_default() {

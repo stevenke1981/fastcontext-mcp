@@ -17,3 +17,10 @@
 **Trigger:** `.opencode/status-footer/state.json` kept changing during the session but was tracked in git.
 **Rule:** Add OpenCode runtime state directories (`.opencode/status-footer/`) to `.gitignore` before initial commit to avoid constantly dirty tree.
 **Source:** fastcontext-mcp-rust completion plan
+
+---
+
+## Lesson #4 — 2026-06-17
+**Trigger:** Adding `base_url`/`model` tool arguments required modifying `ExploreArgs` struct and the CLI argument builder — a coordinated change across two layers.
+**Rule:** When adding optional CLI passthrough parameters, update: (1) the args struct, (2) the input schema in `tools_list_result()`, (3) the async runner that builds the CLI command — in that order.
+**Source:** fastcontext-mcp-rust improvement plan
