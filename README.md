@@ -90,6 +90,26 @@ cargo build --release
 
 The binary is at `target/release/fastcontext-mcp-rust.exe`.
 
+For system-wide installation:
+
+```bash
+# Windows PowerShell
+./install.ps1
+
+# Linux / macOS
+./install.sh
+```
+
+To uninstall:
+
+```bash
+# Windows PowerShell
+./uninstall.ps1
+
+# Linux / macOS
+./uninstall.sh
+```
+
 ### 4. OpenCode config
 
 Copy `examples/opencode.jsonc` into your OpenCode config and adjust paths for your setup.
