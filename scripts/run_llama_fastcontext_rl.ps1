@@ -6,7 +6,7 @@
     Reduce to 65536 or 32768 if memory constrained.
 .PARAMETER Port
     Server port. Default 30000.
-.PARAMETER Host
+.PARAMETER BindHost
     Bind address. Default 0.0.0.0.
 .PARAMETER NGpuLayers
     GPU layers (-1 = CPU only, 99 = max offload). Default 99.
@@ -19,21 +19,30 @@
 param(
     [int]    $CtxSize    = 262144,
     [int]    $Port       = 30000,
-    [string] $Host       = "0.0.0.0",
+    [string] $BindHost   = "0.0.0.0",
     [int]    $NGpuLayers = 99,
     [string] $HfRepo     = "mitkox/FastContext-1.0-4B-RL-Q4_K_M-GGUF",
-    [string] $HfFile     = "fastcontext-1.0-4b-rl-q4_k_m.gguf"
+    [string] $HfFile     = "fastcontext-1.0-4b-rl-q4_k_m.gguf",
+    [string] $LlamaDir   = "$env:USERPROFILE\.config\llama-cpp"
 )
 
 # --- Pre-flight checks ---
 
-# 1. Check llama-server is on PATH
+# 1. Locate llama-server (PATH first, then default install dir)
 $llamaServer = Get-Command "llama-server" -ErrorAction SilentlyContinue
 if (-not $llamaServer) {
-    Write-Error "llama-server not found. Install llama.cpp first:"
-    Write-Error "  Windows: build from https://github.com/ggml-org/llama.cpp"
-    Write-Error "  Or download release binaries from GitHub releases"
-    exit 1
+    $fallback = "$LlamaDir\llama-server.exe"
+    if (Test-Path -LiteralPath $fallback) {
+        $llamaServer = $fallback
+        Write-Host "[*] Found llama-server at: $fallback"
+    } else {
+        Write-Error "llama-server not found. Install llama.cpp:"
+        Write-Error "  Download from: https://github.com/ggml-org/llama.cpp/releases"
+        Write-Error "  Or copy to: $LlamaDir"
+        exit 1
+    }
+} else {
+    $llamaServer = $llamaServer.Source
 }
 
 # 2. Estimate memory needed
@@ -49,7 +58,7 @@ if ($estGb -gt 16) {
 $argsList = @(
     "--hf-repo", $HfRepo,
     "--hf-file", $HfFile,
-    "--host", $Host,
+    "--host", $BindHost,
     "--port", $Port.ToString(),
     "--ctx-size", $CtxSize.ToString(),
     "--jinja",
@@ -63,8 +72,8 @@ if ($NGpuLayers -ge 0) {
 
 Write-Host "[*] Starting llama-server..."
 Write-Host "    Model : $HfRepo / $HfFile"
-Write-Host "    Endpoint : http://${Host}:${Port}/v1/chat/completions"
+Write-Host "    Endpoint : http://${BindHost}:${Port}/v1/chat/completions"
 Write-Host "    Context : $CtxSize tokens"
 Write-Host ""
 
-& "llama-server" $argsList
+& $llamaServer $argsList
