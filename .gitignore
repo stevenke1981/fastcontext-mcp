@@ -16,3 +16,18 @@ ${PROJECT_ROOT}/
 
 # OpenCode runtime session state
 .opencode/status-footer/
+
+# llama.cpp binaries & DLLs (if copied into repo)
+llama-*.exe
+llama-*.dll
+ggml-*.dll
+mtmd.dll
+rpc-server.exe
+
+# Model weight files (large binary, never commit)
+*.gguf
+*.safetensors
+*.bin
+
+# Shared model cache under project root
+.config/
