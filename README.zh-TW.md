@@ -14,9 +14,8 @@ FastContext 模型（透過 OpenAI Chat Completions API）通訊，使用 Read/G
 - [架構](#架構)
 - [快速開始](#快速開始)
   - [1. 在本機執行模型](#1-在本機執行模型)
-  - [2. 安裝 FastContext CLI](#2-安裝-fastcontext-cli)
-  - [3. 建置 MCP 伺服器](#3-建置-mcp-伺服器)
-  - [4. OpenCode 配置](#4-opencode-配置)
+  - [2. 建置 MCP 伺服器](#2-建置-mcp-伺服器)
+  - [3. OpenCode 配置](#3-opencode-配置)
 - [工具](#工具)
   - [`fastcontext_explore`](#fastcontext_explore)
   - [`fastcontext_status`](#fastcontext_status)
@@ -71,21 +70,7 @@ Windows PowerShell：
 （`mitkox/FastContext-1.0-4B-RL-Q4_K_M-GGUF`，約 2.5 GB）。
 若記憶體不足，可使用 `--ctx-size 65536` 減少上下文長度。
 
-### 2. 安裝 FastContext CLI
-
-```bash
-git clone https://github.com/microsoft/fastcontext.git
-cd fastcontext
-uv tool install .
-```
-
-驗證：
-
-```bash
-fastcontext --query "Locate request validation logic" --citation
-```
-
-### 3. 建置 MCP 伺服器
+### 2. 建置 MCP 伺服器
 
 ```bash
 cargo build --release
@@ -113,7 +98,7 @@ cargo build --release
 ./uninstall.sh
 ```
 
-### 4. OpenCode 配置
+### 3. OpenCode 配置
 
 將 `examples/opencode.jsonc` 複製到您的 OpenCode 配置中，
 並根據您的環境調整路徑。
@@ -122,7 +107,7 @@ cargo build --release
 
 ### `fastcontext_explore`
 
-使用 Microsoft FastContext CLI 探索倉庫。唯讀操作；回傳精簡的檔案路徑與行號範圍。
+使用內建 LLM agent loop 探索倉庫。agent 會呼叫 Read/Glob/Grep 工具尋找相關程式碼，最後回傳精簡的檔案路徑與行號範圍。
 
 引數：
 
@@ -131,10 +116,7 @@ cargo build --release
   "query": "尋找認證中介軟體的實作位置",
   "work_dir": "D:/your-repo",
   "max_turns": 6,
-  "citation": true,
-  "trajectory_file": ".fastcontext/trajectory.jsonl",
   "timeout_secs": 300,
-  "verbose": false,
   "base_url": "http://127.0.0.1:30000/v1",
   "model": "microsoft/FastContext-1.0-4B-RL",
   "api_key": "dummy"
@@ -146,7 +128,7 @@ cargo build --release
 
 ### `fastcontext_status`
 
-診斷工具——回傳伺服器配置、`fastcontext` 二進位檔可用性、環境變數狀態與預設設定。
+診斷工具——回傳伺服器配置、LLM 端點設定與預設參數。
 
 ```json
 {
@@ -159,21 +141,19 @@ cargo build --release
 
 ```
 server:     fastcontext-mcp-rust v0.1.0
-binary:     fastcontext ✓
+base_url:   http://127.0.0.1:30000/v1
+model:      microsoft/FastContext-1.0-4B-RL
+api_key:    ✓ (set)
 work_dir:   D:\repo
 allowed_root: D:\repo
 max_turns:  6
 timeout:    300s
-BASE_URL:   http://127.0.0.1:30000/v1
-MODEL:      microsoft/FastContext-1.0-4B-RL
-API_KEY:    ✓ (set)
 ```
 
 ## 環境變數
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `FASTCONTEXT_BIN` | `fastcontext` | FastContext CLI 二進位檔路徑 |
 | `FASTCONTEXT_WORK_DIR` | 目前目錄 | 預設倉庫工作目錄 |
 | `FASTCONTEXT_ALLOWED_ROOT` | 同 work dir | `work_dir` 驗證的根目錄 |
 | `FASTCONTEXT_MAX_TURNS` | `6` | 預設最大探索回合數 |
@@ -186,7 +166,7 @@ API_KEY:    ✓ (set)
 
 ## 開發
 
-前置需求：[Rust](https://rustup.rs/)（stable）、`fastcontext` CLI。
+前置需求：[Rust](https://rustup.rs/)（stable）。
 
 ```bash
 # 檢查程式碼
@@ -209,4 +189,8 @@ CI 會在推送 / PR 時透過 GitHub Actions 自動執行這些檢查（參見 
 此封裝器刻意設計為唯讀。它僅暴露 FastContext 探索功能，
 不暴露 shell 執行、檔案寫入、git、cargo 或任意指令。
 `work_dir` 必須在 `FASTCONTEXT_ALLOWED_ROOT` 內；
-`trajectory_file` 必須是倉庫下的相對路徑。
+Read/Glob/Grep 的路徑與 include pattern 必須是倉庫下的相對路徑，且 canonical path 不可透過 symlink 逃逸出 `work_dir`。
+
+## 授權注意事項
+
+本專案程式碼採 MIT 授權；但 `microsoft/FastContext-1.0-4B-RL` 模型有自己的授權限制。若要商業或生產用途部署，請先確認模型授權，或改用符合用途的 OpenAI-compatible 模型端點。

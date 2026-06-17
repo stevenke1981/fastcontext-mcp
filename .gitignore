@@ -16,6 +16,12 @@ ${PROJECT_ROOT}/
 
 # OpenCode runtime session state
 .opencode/status-footer/
+.opencode/memory.db*
+.opencode/tantivy/
+.opencode/vectors.usearch
+
+# Codebase Memory generated index artifacts
+.codebase-memory/
 
 # llama.cpp binaries & DLLs (if copied into repo)
 llama-*.exe

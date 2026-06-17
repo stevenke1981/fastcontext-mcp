@@ -25,7 +25,7 @@ fastcontext_explore(query)
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `ureq` | 3 | Blocking HTTP client |
+| `ureq` | 2 | Blocking HTTP client with JSON support and minimal Windows TLS surface |
 | `glob` | 0.3 | Glob file matching |
 | `regex` | 1 | Grep content search |
 
@@ -33,9 +33,9 @@ fastcontext_explore(query)
 
 | Tool | Description | Safety |
 |------|-------------|--------|
-| `read` | Read file with line numbers (max 200 lines) | Path sanitized, anchored to work_dir |
-| `glob` | Find files by glob pattern (max 50 results) | Scoped to work_dir |
-| `grep` | Regex content search (max 30 results) | Scoped to work_dir |
+| `read` | Read file with line numbers (max 200 lines) | Relative path only; canonicalized under work_dir to reject symlink escape |
+| `glob` | Find files by glob pattern (max 50 results) | Relative pattern only; matched paths are canonicalized under work_dir |
+| `grep` | Regex content search (max 30 results) | Relative include pattern only; matched files are canonicalized under work_dir |
 
 ## Config Changes
 
@@ -78,7 +78,8 @@ for turn in 0..max_turns:
 | Scenario | Behavior |
 |----------|----------|
 | LLM unreachable | Return clear error: "Cannot reach model server at {url}" |
-| Invalid tool_calls | Skip, log warning, continue |
+| Invalid tool_calls | Return tool error text to the LLM, then continue |
 | Tool execution error | Return error text to LLM, let it recover |
-| Max turns reached | Return accumulated context + note |
-| Timeout | Same existing timeout mechanism |
+| Repeated tool calls | Stop early with partial `<final_answer>` if evidence exists |
+| Max turns reached | Return partial `<final_answer>` with accumulated evidence when possible |
+| Timeout | Return partial `<final_answer>` with accumulated evidence when possible; otherwise error |

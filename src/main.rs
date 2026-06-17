@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -250,39 +251,95 @@ fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+
+        if file_type.is_symlink() {
+            if path.is_file() {
+                files.push(path);
+            }
+            continue;
+        }
+
+        if file_type.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Skip hidden dirs and common build artifacts
             if !name.starts_with('.') && name != "node_modules" && name != "target" {
                 files.extend(walk_dir(&path)?);
             }
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             files.push(path);
         }
     }
     Ok(files)
 }
 
-/// Sanitize and resolve a file_path relative to work_dir.
-/// Rejects paths with `..`, absolute paths, and paths escaping work_dir.
-fn sanitize_path(work_dir: &Path, file_path: &str) -> Result<PathBuf> {
-    let p = PathBuf::from(file_path);
+/// Validate a user-supplied path or glob pattern as relative to work_dir.
+fn validate_relative_input(input: &str, label: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(input);
+    if input.trim().is_empty() {
+        bail!("{label} cannot be empty");
+    }
     if p.is_absolute() {
-        bail!("file_path must be relative: {file_path}");
+        bail!("{label} must be relative: {input}");
     }
     for c in p.components() {
         if matches!(
             c,
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         ) {
-            bail!("file_path must stay under work_dir: {file_path}");
+            bail!("{label} must stay under work_dir: {input}");
         }
     }
+    Ok(p)
+}
+
+/// Sanitize and resolve a file_path relative to work_dir.
+/// Rejects paths with `..`, absolute paths, and lexical escapes.
+fn sanitize_path(work_dir: &Path, file_path: &str) -> Result<PathBuf> {
+    let p = validate_relative_input(file_path, "file_path")?;
     let resolved = work_dir.join(&p);
     if !resolved.starts_with(work_dir) {
         bail!("file_path escapes work_dir: {file_path}");
     }
     Ok(resolved)
+}
+
+/// Canonicalize an existing path and ensure symlinks cannot escape work_dir.
+fn canonicalize_under_work_dir(work_dir: &Path, path: &Path) -> Result<PathBuf> {
+    let root = work_dir
+        .canonicalize()
+        .with_context(|| format!("cannot canonicalize work_dir: {}", work_dir.display()))?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("cannot canonicalize path: {}", path.display()))?;
+
+    if !canonical.starts_with(&root) {
+        bail!(
+            "path escapes work_dir through symlink or canonicalization: {}",
+            path.display()
+        );
+    }
+
+    Ok(canonical)
+}
+
+fn relative_display_path(work_dir: &Path, path: &Path) -> String {
+    let root = work_dir
+        .canonicalize()
+        .unwrap_or_else(|_| work_dir.to_path_buf());
+    path.strip_prefix(&root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn glob_pattern(work_dir: &Path, pattern: &str) -> Result<String> {
+    let rel = validate_relative_input(pattern, "glob pattern")?;
+    let full_pattern = work_dir.join(rel);
+    full_pattern
+        .to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("invalid glob pattern path"))
 }
 
 /// Read a file with line numbers, limited to MAX_LINES.
@@ -291,6 +348,7 @@ fn tool_read(work_dir: &Path, file_path: &str) -> Result<String> {
     const MAX_CHARS: usize = 8000;
 
     let path = sanitize_path(work_dir, file_path)?;
+    let path = canonicalize_under_work_dir(work_dir, &path)?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("cannot read file: {}", path.display()))?;
 
@@ -321,23 +379,23 @@ fn tool_read(work_dir: &Path, file_path: &str) -> Result<String> {
 fn tool_glob(work_dir: &Path, pattern: &str) -> Result<String> {
     const MAX_RESULTS: usize = 50;
 
-    let full_pattern = work_dir.join(pattern);
-    let pattern_str = full_pattern
-        .to_str()
-        .ok_or_else(|| anyhow!("invalid pattern path"))?;
+    let pattern_str = glob_pattern(work_dir, pattern)?;
 
     let mut results: Vec<String> = Vec::new();
-    for entry in glob::glob(pattern_str)? {
+    for entry in glob::glob(&pattern_str)? {
         match entry {
             Ok(path) => {
+                if path.is_dir() {
+                    continue;
+                }
+                let safe_path = match canonicalize_under_work_dir(work_dir, &path) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
                 if results.len() >= MAX_RESULTS {
                     break;
                 }
-                if let Ok(rel) = path.strip_prefix(work_dir) {
-                    results.push(rel.display().to_string());
-                } else {
-                    results.push(path.display().to_string());
-                }
+                results.push(relative_display_path(work_dir, &safe_path));
             }
             Err(e) => results.push(format!("(error: {e})")),
         }
@@ -356,11 +414,8 @@ fn tool_grep(work_dir: &Path, pattern: &str, include: Option<&str>) -> Result<St
     let re = Regex::new(pattern).map_err(|e| anyhow!("invalid regex pattern '{pattern}': {e}"))?;
 
     let files: Vec<PathBuf> = if let Some(glob_pat) = include.filter(|s| !s.is_empty()) {
-        let full = work_dir.join(glob_pat);
-        let pat_str = full
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid glob pattern"))?;
-        glob::glob(pat_str)?
+        let pat_str = glob_pattern(work_dir, glob_pat)?;
+        glob::glob(&pat_str)?
             .filter_map(|e| e.ok())
             .filter(|p| p.is_file())
             .collect()
@@ -370,15 +425,15 @@ fn tool_grep(work_dir: &Path, pattern: &str, include: Option<&str>) -> Result<St
 
     let mut results: Vec<String> = Vec::new();
     for file_path in files {
-        let content = match fs::read_to_string(&file_path) {
+        let safe_path = match canonicalize_under_work_dir(work_dir, &file_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let content = match fs::read_to_string(&safe_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let rel = file_path
-            .strip_prefix(work_dir)
-            .unwrap_or(&file_path)
-            .display()
-            .to_string();
+        let rel = relative_display_path(work_dir, &safe_path);
 
         for (i, line) in content.lines().enumerate() {
             if results.len() >= MAX_RESULTS {
@@ -423,6 +478,60 @@ fn execute_tool(work_dir: &Path, name: &str, args: &Value) -> Result<String> {
         }
         other => bail!("unknown tool: {other}"),
     }
+}
+
+fn collect_tool_evidence(evidence: &mut Vec<String>, name: &str, raw_args: &str, result: &str) {
+    const MAX_EVIDENCE: usize = 40;
+    const MAX_LINES_PER_TOOL: usize = 8;
+    const MAX_LINE_CHARS: usize = 320;
+
+    if evidence.len() >= MAX_EVIDENCE {
+        return;
+    }
+
+    let mut added = 0;
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("Error:")
+            || trimmed.starts_with("(no ")
+            || trimmed.starts_with("... (")
+        {
+            continue;
+        }
+
+        let mut item = trimmed.to_string();
+        if item.len() > MAX_LINE_CHARS {
+            item.truncate(MAX_LINE_CHARS);
+            item.push_str("...");
+        }
+
+        evidence.push(format!("- {name} {raw_args}: {item}"));
+        added += 1;
+        if added >= MAX_LINES_PER_TOOL || evidence.len() >= MAX_EVIDENCE {
+            break;
+        }
+    }
+}
+
+fn partial_final_answer(reason: &str, evidence: &[String]) -> String {
+    let mut out = String::from("<final_answer>\n");
+    out.push_str(&format!(
+        "Summary: Partial answer generated because {reason}.\n\n"
+    ));
+    out.push_str("Files:\n");
+
+    if evidence.is_empty() {
+        out.push_str("- No usable file evidence was collected before stopping.\n");
+    } else {
+        for item in evidence.iter().take(20) {
+            out.push_str(item);
+            out.push('\n');
+        }
+    }
+
+    out.push_str("</final_answer>");
+    out
 }
 
 // ============================================================
@@ -508,10 +617,19 @@ fn run_explorer(config: &Config, args: ExploreArgs) -> Result<String> {
     ];
 
     let start = std::time::Instant::now();
+    let mut seen_tool_calls: HashSet<String> = HashSet::new();
+    let mut repeated_tool_calls = 0usize;
+    let mut evidence: Vec<String> = Vec::new();
 
     for _turn in 0..max_turns {
         if start.elapsed().as_secs() > timeout_secs {
-            bail!("exploration timed out after {timeout_secs}s");
+            if evidence.is_empty() {
+                bail!("exploration timed out after {timeout_secs}s");
+            }
+            return Ok(partial_final_answer(
+                &format!("exploration timed out after {timeout_secs}s"),
+                &evidence,
+            ));
         }
 
         let resp = llm_chat(&base_url, &model, &api_key, &messages, &tools_def)?;
@@ -535,6 +653,15 @@ fn run_explorer(config: &Config, args: ExploreArgs) -> Result<String> {
             }
             "tool_calls" => {
                 let tool_calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+                if tool_calls.is_empty() {
+                    if evidence.is_empty() {
+                        bail!("LLM requested tool calls but returned none");
+                    }
+                    return Ok(partial_final_answer(
+                        "the LLM requested tool calls but returned none",
+                        &evidence,
+                    ));
+                }
 
                 // Push assistant message with tool_calls
                 let mut assistant_msg = json!({
@@ -553,18 +680,33 @@ fn run_explorer(config: &Config, args: ExploreArgs) -> Result<String> {
                     let func = &tc["function"];
                     let name = func["name"].as_str().unwrap_or("unknown");
                     let raw_args = func["arguments"].as_str().unwrap_or("{}");
+                    let signature = format!("{name}:{raw_args}");
 
                     let args_val: Value =
                         serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
 
-                    let result = execute_tool(&work_dir, name, &args_val)
-                        .unwrap_or_else(|e| format!("Error: {e}"));
+                    let result = if !seen_tool_calls.insert(signature) {
+                        repeated_tool_calls += 1;
+                        format!("Error: repeated tool call skipped: {name} {raw_args}")
+                    } else {
+                        let result = execute_tool(&work_dir, name, &args_val)
+                            .unwrap_or_else(|e| format!("Error: {e}"));
+                        collect_tool_evidence(&mut evidence, name, raw_args, &result);
+                        result
+                    };
 
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": id,
                         "content": result,
                     }));
+                }
+
+                if repeated_tool_calls >= 2 && !evidence.is_empty() {
+                    return Ok(partial_final_answer(
+                        "the LLM repeated the same tool calls without producing a final answer",
+                        &evidence,
+                    ));
                 }
             }
             other => {
@@ -573,7 +715,14 @@ fn run_explorer(config: &Config, args: ExploreArgs) -> Result<String> {
         }
     }
 
-    bail!("reached maximum exploration turns ({max_turns}) without final answer");
+    if evidence.is_empty() {
+        bail!("reached maximum exploration turns ({max_turns}) without final answer");
+    }
+
+    Ok(partial_final_answer(
+        &format!("the LLM reached maximum exploration turns ({max_turns}) without a final answer"),
+        &evidence,
+    ))
 }
 
 // ============================================================
@@ -819,6 +968,32 @@ mod tests {
         }
     }
 
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "fastcontext_mcp_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = env::temp_dir().join(unique);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn create_file_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(src, dst)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(src, dst)
+        }
+    }
+
     // -- Config::from_env relies on env vars; tested via manual construction
 
     // -- Config::resolve_work_dir --
@@ -865,6 +1040,26 @@ mod tests {
         assert!(sanitize_path(&wd, "a/b/../../../../etc/passwd").is_err());
     }
 
+    #[test]
+    fn test_tool_read_rejects_symlink_escape() {
+        let root = temp_test_dir("root");
+        let outside = temp_test_dir("outside");
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+        let link_path = root.join("link.txt");
+
+        if create_file_symlink(&outside_file, &link_path).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let result = tool_read(&root, "link.txt");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(result.is_err());
+    }
+
     // -- tool_read --
 
     #[test]
@@ -890,6 +1085,21 @@ mod tests {
         assert!(result.contains("Cargo.toml"));
     }
 
+    #[test]
+    fn test_tool_glob_rejects_parent_pattern() {
+        let wd = PathBuf::from(".");
+        let result = tool_glob(&wd, "../*.rs");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_glob_rejects_absolute_pattern() {
+        let wd = PathBuf::from(".");
+        let absolute = env::temp_dir().join("*.rs");
+        let result = tool_glob(&wd, &absolute.display().to_string());
+        assert!(result.is_err());
+    }
+
     // -- tool_grep --
 
     #[test]
@@ -905,6 +1115,23 @@ mod tests {
         // This file should contain "fastcontext_explore"
         let result = tool_grep(&wd, "fastcontext_explore", Some("*.rs")).unwrap();
         assert!(result.contains("fastcontext_explore"));
+    }
+
+    #[test]
+    fn test_tool_grep_rejects_parent_include() {
+        let wd = PathBuf::from(".");
+        let result = tool_grep(&wd, "anything", Some("../*.rs"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_partial_final_answer_uses_final_answer_tags() {
+        let evidence = vec!["- read {\"file_path\":\"src/main.rs\"}: 1: fn main()".to_string()];
+        let answer = partial_final_answer("the model reached max turns", &evidence);
+        assert!(answer.starts_with("<final_answer>"));
+        assert!(answer.contains("Partial answer"));
+        assert!(answer.contains("src/main.rs"));
+        assert!(answer.ends_with("</final_answer>"));
     }
 
     // -- execute_tool --

@@ -24,3 +24,9 @@
 **Trigger:** Adding `base_url`/`model` tool arguments required modifying `ExploreArgs` struct and the CLI argument builder — a coordinated change across two layers.
 **Rule:** When adding optional CLI passthrough parameters, update: (1) the args struct, (2) the input schema in `tools_list_result()`, (3) the async runner that builds the CLI command — in that order.
 **Source:** fastcontext-mcp-rust improvement plan
+
+---
+## Lesson #5 — 2026-06-18
+**Trigger:** Project docs claimed symlink escape protection, but `sanitize_path()` only performed lexical path checks before the hardening pass.
+**Rule:** When documenting path-safety guarantees, add regression tests for the exact guarantee, including canonical symlink escape checks and glob/include traversal rejection.
+**Source:** fastcontext-mcp-rust hardening plan
