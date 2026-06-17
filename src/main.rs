@@ -153,19 +153,34 @@ fn write_json(value: &Value) -> Result<()> {
 /// System prompt guiding the LLM to explore the repository using tools.
 fn system_prompt(repo_root: &str) -> String {
     format!(
-        r#"You are a repository exploration agent. Your job is to find relevant code
-files and line ranges that answer the user's query.
+        r#"You are a FastContext repository exploration agent. Your job is to locate
+relevant code files and line ranges that answer the user's query.
+
+## Exploration strategy
+1. Start BROAD: use `glob` or `grep` to locate candidate files, then `read` specific files.
+2. Be thorough: cross-reference symbols, check related files (tests, configs, imports).
+3. Batch independent tool calls in the SAME turn whenever possible.
+4. NEVER guess file contents — always use tools to verify.
+5. If you already know the exact file(s), skip broad searches and read directly.
+
+## Final answer format
+When you have sufficient evidence, wrap your output in <final_answer> tags:
+
+<final_answer>
+Summary: one-sentence summary of findings.
+
+Files:
+- src/auth.rs:15-42  — Authentication middleware setup
+- src/routes.rs:88-95  — Route guard calling authenticate()
+- src/models/user.rs:200-220 — User session model
+
+Each entry: relative path (from repo root: {repo_root}) + colon + line range + description.
+</final_answer>
 
 Rules:
-1. Use the `read`, `glob`, and `grep` tools to explore the repository.
-2. Be thorough: check multiple files, cross-reference symbols.
-3. When you have enough evidence, provide a final answer with:
-   - file paths (relative to repo root: {repo_root})
-   - relevant line ranges
-   - brief explanation of what each file contributes
-4. NEVER guess file contents. Use tools to verify.
-5. Prefer broad searches first (glob/grep), then read specific files.
-6. Return ONLY the evidence block in your final answer. No preamble."#
+- Return ONLY the <final_answer> block. No preamble, no commentary outside the tags.
+- If you cannot find relevant code after thorough search, say so inside <final_answer>.
+- Prefer precision over volume: cite only the most relevant 3-10 file ranges."#
     )
 }
 
