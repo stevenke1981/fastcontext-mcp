@@ -5,8 +5,9 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](rust-toolchain.toml)
 ![GitHub last commit](https://img.shields.io/github/last-commit/stevenke1981/fastcontext-mcp)
 
-以 Rust 撰寫的本地 MCP stdio 伺服器。它封裝上游的 `fastcontext` CLI，並指向
-在本機以 `microsoft/FastContext-1.0-4B-RL` 運行的 OpenAI 相容模型伺服器。
+以 Rust 撰寫的本地 MCP stdio 伺服器，內建 **LLM agent loop**。它直接與本地
+FastContext 模型（透過 OpenAI Chat Completions API）通訊，使用 Read/Glob/Grep
+工具進行倉庫探索 ── 不需外部 CLI 依賴。
 
 ## 目錄
 
@@ -27,12 +28,11 @@
 
 ```text
 OpenCode / MCP client
-  -> fastcontext-mcp-rust (stdio)
-  -> fastcontext CLI
+  -> fastcontext-mcp-rust over stdio (agent loop + read/glob/grep tools)
   -> http://127.0.0.1:30000/v1/chat/completions
   -> microsoft/FastContext-1.0-4B-RL
-       方案 A：SGLang/vLLM（BF16，完整精度）
-       方案 B：llama.cpp   （GGUF Q4_K_M，2.5 GB，不需 Python）
+       Option A: SGLang/vLLM (BF16, full precision)
+       Option B: llama.cpp   (GGUF Q4_K_M, 2.5 GB, no Python needed)
 ```
 
 ## 快速開始

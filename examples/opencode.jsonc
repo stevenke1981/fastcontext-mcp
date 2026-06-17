@@ -3,13 +3,12 @@
   "mcp": {
     "fastcontext": {
       "type": "local",
-      "command": ["D:/tools/fastcontext-mcp-rust/target/release/fastcontext-mcp-rust.exe"],
+      "command": ["C:\\Users\\<USER>\\.config\\fastcontext\\bin\\fastcontext-mcp-rust.exe"],
       "enabled": true,
       "timeout": 300000,
       "environment": {
-        "FASTCONTEXT_BIN": "fastcontext",
         "FASTCONTEXT_WORK_DIR": "D:/your-repo",
-        "FASTCONTEXT_ALLOWED_ROOT": "D:/your-repo",
+        "FASTCONTEXT_ALLOWED_ROOT": "D:/",
         "FASTCONTEXT_MAX_TURNS": "6",
         "FASTCONTEXT_TIMEOUT_SECS": "300",
         "BASE_URL": "http://127.0.0.1:30000/v1",

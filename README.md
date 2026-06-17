@@ -13,7 +13,7 @@ Local MCP stdio server written in Rust with a **built-in LLM agent loop**. It co
 - [Quick Start](#quick-start)
   - [1. Run the model locally](#1-run-the-model-locally)
   - [2. Build MCP server](#2-build-mcp-server)
-  - [4. OpenCode config](#4-opencode-config)
+  - [3. OpenCode config](#3-opencode-config)
 - [Tools](#tools)
   - [`fastcontext_explore`](#fastcontext_explore)
   - [`fastcontext_status`](#fastcontext_status)
@@ -94,7 +94,7 @@ To uninstall:
 ./uninstall.sh
 ```
 
-### 4. OpenCode config
+### 3. OpenCode config
 
 Copy `examples/opencode.jsonc` into your OpenCode config and adjust paths for your setup.
 
@@ -102,7 +102,7 @@ Copy `examples/opencode.jsonc` into your OpenCode config and adjust paths for yo
 
 ### `fastcontext_explore`
 
-Explore a repository using Microsoft FastContext CLI. Read-only; returns compact file paths and line ranges.
+Explore a repository using the built-in LLM agent loop. The agent uses Read/Glob/Grep tools to find relevant code, then returns file paths and line ranges.
 
 Arguments:
 
@@ -111,10 +111,7 @@ Arguments:
   "query": "Find where authentication middleware is implemented",
   "work_dir": "D:/your-repo",
   "max_turns": 6,
-  "citation": true,
-  "trajectory_file": ".fastcontext/trajectory.jsonl",
   "timeout_secs": 300,
-  "verbose": false,
   "base_url": "http://127.0.0.1:30000/v1",
   "model": "microsoft/FastContext-1.0-4B-RL",
   "api_key": "dummy"
