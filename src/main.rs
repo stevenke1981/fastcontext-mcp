@@ -138,7 +138,7 @@ fn write_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn tools_list_result(_config: &Config) -> Value {
+fn tools_list_result() -> Value {
     json!({
         "tools": [
             {
@@ -417,7 +417,6 @@ fn handle_tools_call(config: &Config, params: Option<Value>) -> Value {
                     let msg = err.to_string();
                     // Improve error message for common "binary not found" case
                     let enriched = if msg.contains("program not found")
-                        || msg.contains("program not found")
                         || msg.contains("No such file")
                         || msg.to_lowercase().contains("cannot find")
                     {
@@ -465,7 +464,7 @@ fn handle_request(config: &Config, req: JsonRpcRequest) -> Option<Value> {
                 "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")}
             })
         }
-        "tools/list" => tools_list_result(config),
+        "tools/list" => tools_list_result(),
         "tools/call" => handle_tools_call(config, req.params),
         "ping" => json!({}),
         _ => {
@@ -620,15 +619,13 @@ mod tests {
 
     #[test]
     fn test_tools_list_has_tools_key() {
-        let cfg = test_config();
-        let result = tools_list_result(&cfg);
+        let result = tools_list_result();
         assert!(result.get("tools").is_some());
     }
 
     #[test]
     fn test_tools_list_contains_fastcontext_explore() {
-        let cfg = test_config();
-        let result = tools_list_result(&cfg);
+        let result = tools_list_result();
         let tools = result["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"fastcontext_explore"));
@@ -636,8 +633,7 @@ mod tests {
 
     #[test]
     fn test_tools_list_input_schema_has_query_required() {
-        let cfg = test_config();
-        let result = tools_list_result(&cfg);
+        let result = tools_list_result();
         let tool = &result["tools"][0];
         let schema = &tool["inputSchema"];
         let required = schema["required"].as_array().unwrap();
@@ -646,8 +642,7 @@ mod tests {
 
     #[test]
     fn test_tools_list_contains_fastcontext_status() {
-        let cfg = test_config();
-        let result = tools_list_result(&cfg);
+        let result = tools_list_result();
         let tools = result["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"fastcontext_status"));

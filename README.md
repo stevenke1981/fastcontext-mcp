@@ -1,6 +1,26 @@
 # fastcontext-mcp-rust
 
+[![CI](https://github.com/stevenke1981/fastcontext-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/stevenke1981/fastcontext-mcp/actions/workflows/ci.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](rust-toolchain.toml)
+![GitHub last commit](https://img.shields.io/github/last-commit/stevenke1981/fastcontext-mcp)
+
 Local MCP stdio server written in Rust. It wraps the upstream `fastcontext` CLI and points it at a local OpenAI-compatible model server running `microsoft/FastContext-1.0-4B-RL`.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Quick Start](#quick-start)
+  - [1. Run the model locally](#1-run-the-model-locally)
+  - [2. Install FastContext CLI](#2-install-fastcontext-cli)
+  - [3. Build MCP server](#3-build-mcp-server)
+  - [4. OpenCode config](#4-opencode-config)
+- [Tools](#tools)
+  - [`fastcontext_explore`](#fastcontext_explore)
+  - [`fastcontext_status`](#fastcontext_status)
+- [Environment variables](#environment-variables)
+- [Development](#development)
+- [Security notes](#security-notes)
 
 ## Architecture
 
@@ -14,9 +34,11 @@ OpenCode / MCP client
        Option B: llama.cpp   (GGUF Q4_K_M, 2.5 GB, no Python needed)
 ```
 
-## 1. Run the model locally
+## Quick Start
 
-SGLang:
+### 1. Run the model locally
+
+**SGLang** (full precision):
 
 ```bash
 pip install "sglang[all]"
@@ -46,7 +68,7 @@ Windows PowerShell:
 
 The script auto-downloads the GGUF model (`mitkox/FastContext-1.0-4B-RL-Q4_K_M-GGUF`, ~2.5 GB) from HuggingFace on first run. Reduce context with `--ctx-size 65536` if memory constrained.
 
-## 2. Install FastContext CLI
+### 2. Install FastContext CLI
 
 ```bash
 git clone https://github.com/microsoft/fastcontext.git
@@ -60,19 +82,23 @@ Check:
 fastcontext --query "Locate request validation logic" --citation
 ```
 
-## 3. Build MCP server
+### 3. Build MCP server
 
 ```bash
 cargo build --release
 ```
 
-## 4. OpenCode config
+The binary is at `target/release/fastcontext-mcp-rust.exe`.
 
-Copy `examples/opencode.jsonc` into your OpenCode config and change paths.
+### 4. OpenCode config
 
-## Tool
+Copy `examples/opencode.jsonc` into your OpenCode config and adjust paths for your setup.
 
-`fastcontext_explore`
+## Tools
+
+### `fastcontext_explore`
+
+Explore a repository using Microsoft FastContext CLI. Read-only; returns compact file paths and line ranges.
 
 Arguments:
 
@@ -82,20 +108,76 @@ Arguments:
   "work_dir": "D:/your-repo",
   "max_turns": 6,
   "citation": true,
-  "trajectory_file": ".fastcontext/trajectory.jsonl"
+  "trajectory_file": ".fastcontext/trajectory.jsonl",
+  "timeout_secs": 300,
+  "verbose": false,
+  "base_url": "http://127.0.0.1:30000/v1",
+  "model": "microsoft/FastContext-1.0-4B-RL",
+  "api_key": "dummy"
 }
+```
+
+The optional `base_url`, `model`, and `api_key` fields override the corresponding environment variables for that single request — useful for switching between endpoints without restarting the MCP server.
+
+### `fastcontext_status`
+
+Diagnostic tool — returns server configuration, `fastcontext` binary availability, environment variable status, and default settings.
+
+```json
+{
+  "name": "fastcontext_status",
+  "arguments": {}
+}
+```
+
+Response example:
+
+```
+server:     fastcontext-mcp-rust v0.1.0
+binary:     fastcontext ✓
+work_dir:   D:\repo
+allowed_root: D:\repo
+max_turns:  6
+timeout:    300s
+BASE_URL:   http://127.0.0.1:30000/v1
+MODEL:      microsoft/FastContext-1.0-4B-RL
+API_KEY:    ✓ (set)
 ```
 
 ## Environment variables
 
-- `FASTCONTEXT_BIN`: default `fastcontext`
-- `FASTCONTEXT_WORK_DIR`: default current directory
-- `FASTCONTEXT_ALLOWED_ROOT`: default same as work dir
-- `FASTCONTEXT_MAX_TURNS`: default `6`
-- `FASTCONTEXT_TIMEOUT_SECS`: default `300`
-- `BASE_URL`: default must be supplied to FastContext CLI, e.g. `http://127.0.0.1:30000/v1`
-- `MODEL`: `microsoft/FastContext-1.0-4B-RL`
-- `API_KEY`: can be `dummy` for local SGLang/vLLM unless you configured auth
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FASTCONTEXT_BIN` | `fastcontext` | Path to the FastContext CLI binary |
+| `FASTCONTEXT_WORK_DIR` | current directory | Default repository work directory |
+| `FASTCONTEXT_ALLOWED_ROOT` | same as work dir | Directory root for `work_dir` validation |
+| `FASTCONTEXT_MAX_TURNS` | `6` | Default max exploration turns |
+| `FASTCONTEXT_TIMEOUT_SECS` | `300` | Default command timeout in seconds |
+| `BASE_URL` | _(required)_ | OpenAI-compatible endpoint URL, e.g. `http://127.0.0.1:30000/v1` |
+| `MODEL` | _(required)_ | Model name, e.g. `microsoft/FastContext-1.0-4B-RL` |
+| `API_KEY` | `dummy` | API key for the endpoint |
+
+The tool arguments `base_url`, `model`, `api_key` override the corresponding environment variables per-request.
+
+## Development
+
+Prerequisites: [Rust](https://rustup.rs/) (stable), `fastcontext` CLI.
+
+```bash
+# Check code
+cargo check
+
+# Lint
+cargo clippy --all-targets --all-features
+
+# Run tests
+cargo test
+
+# Format
+cargo fmt --check
+```
+
+CI runs these checks automatically on push/PR via GitHub Actions (see [ci.yml](.github/workflows/ci.yml)).
 
 ## Security notes
 
