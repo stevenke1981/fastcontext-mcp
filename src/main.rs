@@ -59,7 +59,8 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let fastcontext_bin = env::var("FASTCONTEXT_BIN").unwrap_or_else(|_| "fastcontext".to_string());
+        let fastcontext_bin =
+            env::var("FASTCONTEXT_BIN").unwrap_or_else(|_| "fastcontext".to_string());
         let default_work_dir = env::var("FASTCONTEXT_WORK_DIR")
             .map(PathBuf::from)
             .unwrap_or(env::current_dir()?);
@@ -92,9 +93,12 @@ impl Config {
         let canonical = raw
             .canonicalize()
             .with_context(|| format!("cannot canonicalize work_dir: {}", raw.display()))?;
-        let allowed = self.allowed_root
-            .canonicalize()
-            .with_context(|| format!("cannot canonicalize FASTCONTEXT_ALLOWED_ROOT: {}", self.allowed_root.display()))?;
+        let allowed = self.allowed_root.canonicalize().with_context(|| {
+            format!(
+                "cannot canonicalize FASTCONTEXT_ALLOWED_ROOT: {}",
+                self.allowed_root.display()
+            )
+        })?;
 
         if !canonical.starts_with(&allowed) {
             bail!(
@@ -223,7 +227,10 @@ async fn run_fastcontext_async(config: &Config, args: ExploreArgs) -> Result<Str
     }
 
     let work_dir = config.resolve_work_dir(args.work_dir.as_deref())?;
-    let max_turns = args.max_turns.unwrap_or(config.default_max_turns).clamp(1, 20);
+    let max_turns = args
+        .max_turns
+        .unwrap_or(config.default_max_turns)
+        .clamp(1, 20);
     let citation = args.citation.unwrap_or(true);
     let timeout_secs = args
         .timeout_secs
@@ -263,7 +270,12 @@ async fn run_fastcontext_async(config: &Config, args: ExploreArgs) -> Result<Str
     let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
         .await
         .map_err(|_| anyhow!("fastcontext timed out after {timeout_secs}s"))?
-        .with_context(|| format!("failed to spawn or wait for FastContext CLI: {}", config.fastcontext_bin))?;
+        .with_context(|| {
+            format!(
+                "failed to spawn or wait for FastContext CLI: {}",
+                config.fastcontext_bin
+            )
+        })?;
 
     if !output.status.success() {
         bail!(
@@ -306,7 +318,9 @@ fn handle_tools_call(config: &Config, params: Option<Value>) -> Value {
 
             match run_fastcontext(config, args) {
                 Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
-                Err(err) => json!({"content": [{"type": "text", "text": err.to_string()}], "isError": true}),
+                Err(err) => {
+                    json!({"content": [{"type": "text", "text": err.to_string()}], "isError": true})
+                }
             }
         }
         other => json!({
@@ -341,7 +355,13 @@ fn handle_request(config: &Config, req: JsonRpcRequest) -> Option<Value> {
         "tools/list" => tools_list_result(),
         "tools/call" => handle_tools_call(config, req.params),
         "ping" => json!({}),
-        _ => return Some(error_response(Some(id), -32601, format!("method not found: {method}"))),
+        _ => {
+            return Some(error_response(
+                Some(id),
+                -32601,
+                format!("method not found: {method}"),
+            ))
+        }
     };
 
     Some(response(id, result))
@@ -537,7 +557,7 @@ mod tests {
         assert_eq!(args.query, "find routes");
         assert_eq!(args.work_dir.unwrap(), "/repo");
         assert_eq!(args.max_turns.unwrap(), 10);
-        assert_eq!(args.citation.unwrap(), false);
+        assert!(!args.citation.unwrap());
     }
 
     #[test]
