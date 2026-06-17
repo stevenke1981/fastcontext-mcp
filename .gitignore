@@ -1,0 +1,18 @@
+# Rust
+/target/
+
+# Editor temp files
+*.swp
+*.swo
+
+# FastContext CLI binary
+fastcontext.exe
+
+# FastContext trajectory data
+.fastcontext/
+
+# CBM artifact (stray ${PROJECT_ROOT} directory)
+${PROJECT_ROOT}/
+
+# OpenCode runtime session state
+.opencode/status-footer/
