@@ -4,15 +4,14 @@ This file is for **AI coding agents** (OpenCode, Claude Code, etc.) working on t
 
 ## Project Overview
 
-`fastcontext-mcp-rust` is a Rust MCP (Model Context Protocol) stdio server. It wraps the
-Microsoft FastContext CLI and exposes a `fastcontext_explore` tool for repository exploration
-via natural language queries.
+`fastcontext-mcp-rust` is a Rust MCP (Model Context Protocol) stdio server with a
+**built-in agent loop**. It communicates directly with a FastContext LLM via OpenAI
+Chat Completions API and provides Read/Glob/Grep tools for repository exploration.
 
 ```
 OpenCode / MCP client
-  -> fastcontext-mcp-rust  (this project)
-  -> fastcontext CLI       (external Python tool)
-  -> FastContext-1.0-4B-RL (LLM via SGLang or llama.cpp)
+  -> fastcontext-mcp-rust  (this project, agent loop + tools)
+  -> FastContext-1.0-4B-RL (LLM via llama.cpp or SGLang)
 ```
 
 ## Repository Layout
@@ -27,7 +26,7 @@ scripts/
   run_llama_fastcontext_rl.ps1/sh    llama.cpp launcher
   run_sglang_fastcontext_rl.ps1/sh   SGLang launcher
 src/
-  main.rs                   Full MCP server (~870 lines)
+  main.rs                   Full MCP server (~950 lines, agent loop + tools)
   (tests in #[cfg(test)] mod at bottom of main.rs)
 install.ps1 / install.sh    Install to ~/.cargo/bin
 uninstall.ps1 / uninstall.sh
@@ -56,42 +55,60 @@ cargo build --release          # Release build with LTO
 
 ## Key Architecture Decisions
 
-### Tools provided:
+### Built-in Agent Loop:
 
-1. **`fastcontext_explore`** — Main tool. Spawns `fastcontext` CLI as a subprocess with piped I/O.
-   Args: `query` (required), `work_dir`, `max_turns`, `citation`, `trajectory_file`,
-   `timeout_secs`, `verbose`, `base_url`, `model`, `api_key`.
+`fastcontext-mcp-rust` implements its own exploration agent loop in Rust —
+**no external CLI dependency required**. The flow:
 
-2. **`fastcontext_status`** — Read-only diagnostic tool. Returns config, binary status,
-   environment variable state.
+1. Receive query via `fastcontext_explore` tool
+2. Build system prompt + tool definitions for the LLM
+3. Call the FastContext model via OpenAI Chat Completions API (`POST /v1/chat/completions`)
+4. LLM returns `tool_calls` → execute Read/Glob/Grep on the filesystem → feed results back
+5. LLM returns `stop` (final answer) → return evidence to caller
+6. Configurable max turns (default 6) and timeout (default 300s)
+
+### Tools provided to the LLM:
+
+1. **`read`** — Read a file with line numbers, max 200 lines.
+2. **`glob`** — Find files matching a glob pattern, max 50 results.
+3. **`grep`** — Search file contents with regex, max 30 matches.
+
+### MCP tools exposed to OpenCode:
+
+1. **`fastcontext_explore`** — Main tool. Triggers the built-in agent loop.
+   Args: `query` (required), `work_dir`, `max_turns`, `timeout_secs`, `base_url`, `model`, `api_key`.
+
+2. **`fastcontext_status`** — Read-only diagnostic tool. Returns config and endpoint status.
 
 ### Safety:
 
 - `work_dir` is validated against `FASTCONTEXT_ALLOWED_ROOT` (canonical path check).
-- `trajectory_file` must be relative; absolute and parent-dir paths are rejected.
-- FastContext spawn has a configurable timeout (default 300s).
+- All file paths passed to Read/Glob/Grep are sanitized: `../`, absolute paths, and
+  symlink escapes are rejected.
+- Read output is capped at 8000 characters; Glob at 50 results; Grep at 30 matches.
+- Agent loop has configurable timeout (default 300s).
 - The server is intentionally read-only — no shell execution, file writing, or code modification.
 
 ### Startup diagnostics:
 
-On startup, the server checks:
-- Whether the `fastcontext` binary is on PATH
-- Whether `BASE_URL` and `MODEL` env vars are set
-- Prints warnings for missing dependencies
+On startup, the server prints:
+- `BASE_URL` and `MODEL` being used
+- Work directory and allowed root
+- Max turns and timeout configuration
 
 ## Testing
 
 All tests are in `src/main.rs` under `#[cfg(test)] mod tests`.
-Currently 31 tests covering:
+Currently 35 tests covering:
 - Path validation (relative, absolute, parent-dir, root)
-- Error truncation
-- Tool list schema
+- Tool execution (read, glob, grep)
+- Tool definitions schema
 - JSON-RPC response format
 - ExploreArgs deserialization (including base_url/model/api_key)
 - Request handlers (initialize, tools/list, ping, unknown, notification)
 - Config::resolve_work_dir
 - server_status_text output
-- check_fastcontext_binary
+- system_prompt validation
 
 ## When Modifying
 

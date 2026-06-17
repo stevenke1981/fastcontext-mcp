@@ -1,18 +1,18 @@
 use anyhow::{anyhow, bail, Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::{Component, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
-use tokio::runtime::Builder;
-use tokio::time::timeout;
+use std::path::{Component, Path, PathBuf};
 
 const SERVER_NAME: &str = "fastcontext-mcp-rust";
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+// ============================================================
+// JSON-RPC types
+// ============================================================
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -30,22 +30,20 @@ struct ToolCallParams {
     arguments: Value,
 }
 
+// ============================================================
+// Domain types
+// ============================================================
+
 #[derive(Debug, Deserialize)]
 struct ExploreArgs {
     /// Natural-language repository exploration request.
     query: String,
     /// Repository directory. Must be inside FASTCONTEXT_ALLOWED_ROOT.
     work_dir: Option<String>,
-    /// Maximum FastContext exploration turns.
+    /// Maximum exploration turns (LLM tool-call iterations).
     max_turns: Option<u32>,
-    /// Return only <final_answer> citation block when possible. Default: true.
-    citation: Option<bool>,
-    /// Relative JSONL trajectory file path under work_dir.
-    trajectory_file: Option<String>,
     /// Override command timeout in seconds.
     timeout_secs: Option<u64>,
-    /// Ask FastContext CLI to print intermediate messages.
-    verbose: Option<bool>,
     /// Override BASE_URL for this request (e.g. http://127.0.0.1:30000/v1).
     base_url: Option<String>,
     /// Override MODEL for this request (e.g. microsoft/FastContext-1.0-4B-RL).
@@ -56,7 +54,9 @@ struct ExploreArgs {
 
 #[derive(Clone, Debug)]
 struct Config {
-    fastcontext_bin: String,
+    base_url: String,
+    model: String,
+    api_key: String,
     default_work_dir: PathBuf,
     allowed_root: PathBuf,
     default_max_turns: u32,
@@ -65,8 +65,10 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let fastcontext_bin =
-            env::var("FASTCONTEXT_BIN").unwrap_or_else(|_| "fastcontext".to_string());
+        let base_url = env::var("BASE_URL").context("BASE_URL environment variable is required")?;
+        let model = env::var("MODEL").context("MODEL environment variable is required")?;
+        let api_key = env::var("API_KEY").unwrap_or_default();
+
         let default_work_dir = env::var("FASTCONTEXT_WORK_DIR")
             .map(PathBuf::from)
             .unwrap_or(env::current_dir()?);
@@ -83,7 +85,9 @@ impl Config {
             .unwrap_or(300);
 
         Ok(Self {
-            fastcontext_bin,
+            base_url,
+            model,
+            api_key,
             default_work_dir,
             allowed_root,
             default_max_turns,
@@ -118,6 +122,10 @@ impl Config {
     }
 }
 
+// ============================================================
+// JSON-RPC helpers
+// ============================================================
+
 fn response(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -138,12 +146,431 @@ fn write_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+// ============================================================
+// Agent tools: read, glob, grep
+// ============================================================
+
+/// System prompt guiding the LLM to explore the repository using tools.
+fn system_prompt(repo_root: &str) -> String {
+    format!(
+        r#"You are a repository exploration agent. Your job is to find relevant code
+files and line ranges that answer the user's query.
+
+Rules:
+1. Use the `read`, `glob`, and `grep` tools to explore the repository.
+2. Be thorough: check multiple files, cross-reference symbols.
+3. When you have enough evidence, provide a final answer with:
+   - file paths (relative to repo root: {repo_root})
+   - relevant line ranges
+   - brief explanation of what each file contributes
+4. NEVER guess file contents. Use tools to verify.
+5. Prefer broad searches first (glob/grep), then read specific files.
+6. Return ONLY the evidence block in your final answer. No preamble."#
+    )
+}
+
+fn tools_definitions() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file from the repository. Returns content with line numbers, max 200 lines.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path relative to repository root, e.g. src/main.rs"
+                        }
+                    },
+                    "required": ["file_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files matching a glob pattern. Returns up to 50 matching paths.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern, e.g. **/*.rs, src/**/*.ts, Cargo.toml"
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search file contents with a regex pattern. Returns up to 30 matches as file:line:content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search, e.g. fn handle_"
+                        },
+                        "include": {
+                            "type": "string",
+                            "description": "Optional file glob filter, e.g. *.rs or src/**/*.rs"
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }
+    ])
+}
+
+/// Walk a directory recursively, collecting non-hidden file paths.
+fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Skip hidden dirs and common build artifacts
+            if !name.starts_with('.') && name != "node_modules" && name != "target" {
+                files.extend(walk_dir(&path)?);
+            }
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// Sanitize and resolve a file_path relative to work_dir.
+/// Rejects paths with `..`, absolute paths, and paths escaping work_dir.
+fn sanitize_path(work_dir: &Path, file_path: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(file_path);
+    if p.is_absolute() {
+        bail!("file_path must be relative: {file_path}");
+    }
+    for c in p.components() {
+        if matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            bail!("file_path must stay under work_dir: {file_path}");
+        }
+    }
+    let resolved = work_dir.join(&p);
+    if !resolved.starts_with(work_dir) {
+        bail!("file_path escapes work_dir: {file_path}");
+    }
+    Ok(resolved)
+}
+
+/// Read a file with line numbers, limited to MAX_LINES.
+fn tool_read(work_dir: &Path, file_path: &str) -> Result<String> {
+    const MAX_LINES: usize = 200;
+    const MAX_CHARS: usize = 8000;
+
+    let path = sanitize_path(work_dir, file_path)?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read file: {}", path.display()))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let shown = lines.iter().take(MAX_LINES);
+
+    let mut out = String::new();
+    for (i, line) in shown.enumerate() {
+        out.push_str(&format!("{:>6}: {}\n", i + 1, line));
+        if out.len() > MAX_CHARS {
+            out.truncate(MAX_CHARS);
+            out.push_str("... (truncated)\n");
+            break;
+        }
+    }
+    if total > MAX_LINES {
+        out.push_str(&format!("... ({}/{}) lines shown\n", MAX_LINES, total));
+    }
+
+    if out.is_empty() {
+        out = "(empty file)\n".to_string();
+    }
+    Ok(out)
+}
+
+/// Find files matching a glob pattern.
+fn tool_glob(work_dir: &Path, pattern: &str) -> Result<String> {
+    const MAX_RESULTS: usize = 50;
+
+    let full_pattern = work_dir.join(pattern);
+    let pattern_str = full_pattern
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid pattern path"))?;
+
+    let mut results: Vec<String> = Vec::new();
+    for entry in glob::glob(pattern_str)? {
+        match entry {
+            Ok(path) => {
+                if results.len() >= MAX_RESULTS {
+                    break;
+                }
+                if let Ok(rel) = path.strip_prefix(work_dir) {
+                    results.push(rel.display().to_string());
+                } else {
+                    results.push(path.display().to_string());
+                }
+            }
+            Err(e) => results.push(format!("(error: {e})")),
+        }
+    }
+
+    if results.is_empty() {
+        return Ok("(no files matched)\n".to_string());
+    }
+    Ok(results.join("\n") + "\n")
+}
+
+/// Search file contents with regex, optionally filtered by glob include.
+fn tool_grep(work_dir: &Path, pattern: &str, include: Option<&str>) -> Result<String> {
+    const MAX_RESULTS: usize = 30;
+
+    let re = Regex::new(pattern).map_err(|e| anyhow!("invalid regex pattern '{pattern}': {e}"))?;
+
+    let files: Vec<PathBuf> = if let Some(glob_pat) = include.filter(|s| !s.is_empty()) {
+        let full = work_dir.join(glob_pat);
+        let pat_str = full
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid glob pattern"))?;
+        glob::glob(pat_str)?
+            .filter_map(|e| e.ok())
+            .filter(|p| p.is_file())
+            .collect()
+    } else {
+        walk_dir(work_dir)?
+    };
+
+    let mut results: Vec<String> = Vec::new();
+    for file_path in files {
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let rel = file_path
+            .strip_prefix(work_dir)
+            .unwrap_or(&file_path)
+            .display()
+            .to_string();
+
+        for (i, line) in content.lines().enumerate() {
+            if results.len() >= MAX_RESULTS {
+                break;
+            }
+            if re.is_match(line) {
+                results.push(format!("{}:{}:{}", rel, i + 1, line));
+            }
+        }
+        if results.len() >= MAX_RESULTS {
+            break;
+        }
+    }
+
+    if results.is_empty() {
+        return Ok(format!("(no matches for pattern '{pattern}')\n"));
+    }
+    Ok(results.join("\n") + "\n")
+}
+
+/// Dispatch a tool call by name and arguments.
+fn execute_tool(work_dir: &Path, name: &str, args: &Value) -> Result<String> {
+    match name {
+        "read" => {
+            let file_path = args["file_path"]
+                .as_str()
+                .ok_or_else(|| anyhow!("read: missing file_path"))?;
+            tool_read(work_dir, file_path)
+        }
+        "glob" => {
+            let pattern = args["pattern"]
+                .as_str()
+                .ok_or_else(|| anyhow!("glob: missing pattern"))?;
+            tool_glob(work_dir, pattern)
+        }
+        "grep" => {
+            let pattern = args["pattern"]
+                .as_str()
+                .ok_or_else(|| anyhow!("grep: missing pattern"))?;
+            let include = args["include"].as_str();
+            tool_grep(work_dir, pattern, include)
+        }
+        other => bail!("unknown tool: {other}"),
+    }
+}
+
+// ============================================================
+// LLM client
+// ============================================================
+
+/// Send a chat completion request to the LLM endpoint.
+fn llm_chat(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    messages: &[Value],
+    tools_def: &Value,
+) -> Result<Value> {
+    let body = json!({
+        "model": model,
+        "messages": messages,
+        "tools": tools_def,
+        "tool_choice": "auto",
+        "max_tokens": 4096,
+        "temperature": 0.1,
+    });
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .send_json(&body)
+        .map_err(|e| anyhow!("LLM API request failed: {e} (url: {url})"))?;
+
+    let json: Value = resp
+        .into_json()
+        .map_err(|e| anyhow!("failed to parse LLM response: {e}"))?;
+
+    // Check for API-level errors
+    if let Some(err) = json.get("error") {
+        bail!(
+            "LLM API error: {}",
+            err["message"].as_str().unwrap_or("unknown")
+        );
+    }
+
+    Ok(json)
+}
+
+// ============================================================
+// Agent loop
+// ============================================================
+
+/// Run the exploration agent loop: send messages to the LLM, execute tool
+/// calls, and return the final answer.
+fn run_explorer(config: &Config, args: ExploreArgs) -> Result<String> {
+    let query = args.query.trim().to_string();
+    if query.is_empty() {
+        bail!("query cannot be empty");
+    }
+    if query.len() > 8000 {
+        bail!("query is too long; keep it focused");
+    }
+
+    let work_dir = config.resolve_work_dir(args.work_dir.as_deref())?;
+    let max_turns = args
+        .max_turns
+        .unwrap_or(config.default_max_turns)
+        .clamp(1, 20);
+    let timeout_secs = args
+        .timeout_secs
+        .unwrap_or(config.default_timeout_secs)
+        .clamp(10, 1800);
+
+    // Effective endpoint settings (per-request overrides)
+    let base_url = args.base_url.unwrap_or_else(|| config.base_url.clone());
+    let model = args.model.unwrap_or_else(|| config.model.clone());
+    let api_key = args.api_key.unwrap_or_else(|| config.api_key.clone());
+
+    let tools_def = tools_definitions();
+    let sys_prompt = system_prompt(&work_dir.display().to_string());
+
+    let mut messages: Vec<Value> = vec![
+        json!({"role": "system", "content": sys_prompt}),
+        json!({"role": "user", "content": query}),
+    ];
+
+    let start = std::time::Instant::now();
+
+    for _turn in 0..max_turns {
+        if start.elapsed().as_secs() > timeout_secs {
+            bail!("exploration timed out after {timeout_secs}s");
+        }
+
+        let resp = llm_chat(&base_url, &model, &api_key, &messages, &tools_def)?;
+
+        let choices = resp["choices"]
+            .as_array()
+            .ok_or_else(|| anyhow!("LLM response missing choices array"))?;
+
+        if choices.is_empty() {
+            bail!("LLM returned empty choices");
+        }
+
+        let choice = &choices[0];
+        let finish_reason = choice["finish_reason"].as_str().unwrap_or("stop");
+        let msg = &choice["message"];
+
+        match finish_reason {
+            "stop" => {
+                let content = msg["content"].as_str().unwrap_or("");
+                return Ok(content.to_string());
+            }
+            "tool_calls" => {
+                let tool_calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+
+                // Push assistant message with tool_calls
+                let mut assistant_msg = json!({
+                    "role": "assistant",
+                    "content": msg["content"],
+                    "tool_calls": tool_calls,
+                });
+                // Avoid null content — OpenAI expects null, not absent
+                if assistant_msg["content"].is_null() {
+                    assistant_msg["content"] = Value::Null;
+                }
+                messages.push(assistant_msg);
+
+                for tc in &tool_calls {
+                    let id = tc["id"].as_str().unwrap_or("call_unknown");
+                    let func = &tc["function"];
+                    let name = func["name"].as_str().unwrap_or("unknown");
+                    let raw_args = func["arguments"].as_str().unwrap_or("{}");
+
+                    let args_val: Value =
+                        serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+
+                    let result = execute_tool(&work_dir, name, &args_val)
+                        .unwrap_or_else(|e| format!("Error: {e}"));
+
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": result,
+                    }));
+                }
+            }
+            other => {
+                bail!("LLM stopped unexpectedly (finish_reason: {other})");
+            }
+        }
+    }
+
+    bail!("reached maximum exploration turns ({max_turns}) without final answer");
+}
+
+// ============================================================
+// MCP handlers
+// ============================================================
+
 fn tools_list_result() -> Value {
     json!({
         "tools": [
             {
                 "name": "fastcontext_explore",
-                "description": "Explore a repository using Microsoft FastContext CLI with the configured FastContext-1.0-4B-RL endpoint. Read-only; returns compact file paths and line ranges.",
+                "description": "Explore a repository using FastContext-1.0-4B-RL. Uses an LLM agent loop with Read/Glob/Grep tools to find relevant code. Read-only; returns file paths and line ranges.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -159,27 +586,14 @@ fn tools_list_result() -> Value {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 20,
-                            "default": 6
-                        },
-                        "citation": {
-                            "type": "boolean",
-                            "default": true,
-                            "description": "Ask FastContext to return only the machine-readable <final_answer> citation block."
-                        },
-                        "trajectory_file": {
-                            "type": "string",
-                            "default": ".fastcontext/trajectory.jsonl",
-                            "description": "Relative path under work_dir for FastContext trajectory JSONL."
+                            "default": 6,
+                            "description": "Maximum LLM tool-call iterations."
                         },
                         "timeout_secs": {
                             "type": "integer",
                             "minimum": 10,
                             "maximum": 1800,
                             "default": 300
-                        },
-                        "verbose": {
-                            "type": "boolean",
-                            "default": false
                         },
                         "base_url": {
                             "type": "string",
@@ -200,7 +614,7 @@ fn tools_list_result() -> Value {
             },
             {
                 "name": "fastcontext_status",
-                "description": "Check the MCP server configuration and fastcontext CLI availability. Read-only diagnostic tool.",
+                "description": "Check the MCP server configuration and LLM endpoint availability. Read-only diagnostic tool.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -212,180 +626,29 @@ fn tools_list_result() -> Value {
     })
 }
 
-fn validate_relative_path(path: &str) -> Result<PathBuf> {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        bail!("trajectory_file must be a relative path");
-    }
-    for c in p.components() {
-        match c {
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("trajectory_file must stay under work_dir")
-            }
-            _ => {}
-        }
-    }
-    Ok(p)
-}
-
-/// Check if the fastcontext binary is available on PATH.
-fn check_fastcontext_binary(name: &str) -> (bool, String) {
-    match std::process::Command::new(name).arg("--help").output() {
-        Ok(_) => (true, "found at PATH or cwd".to_string()),
-        Err(e) => (false, format!("{e}")),
-    }
-}
-
-/// Build a server status report string (used by fastcontext_status tool
-/// and startup diagnostics).
+/// Build a server status report string.
 fn server_status_text(config: &Config) -> String {
-    let (bin_ok, bin_detail) = check_fastcontext_binary(&config.fastcontext_bin);
-
-    let base_url = env::var("BASE_URL").ok();
-    let model = env::var("MODEL").ok();
-    let api_key_set = env::var("API_KEY").ok().map(|v| !v.is_empty());
-
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
         "server:     {} v{}",
         SERVER_NAME,
         env!("CARGO_PKG_VERSION")
     ));
+    lines.push(format!("base_url:   {}", config.base_url));
+    lines.push(format!("model:      {}", config.model));
     lines.push(format!(
-        "binary:     {} {}",
-        config.fastcontext_bin,
-        if bin_ok { "✓" } else { "✗ NOT FOUND" }
+        "api_key:    {}",
+        if config.api_key.is_empty() {
+            "(not set) — OK for local servers".to_string()
+        } else {
+            "✓ (set)".to_string()
+        }
     ));
-    lines.push(format!("binary_detail: {}", bin_detail));
     lines.push(format!("work_dir:   {}", config.default_work_dir.display()));
     lines.push(format!("allowed_root: {}", config.allowed_root.display()));
     lines.push(format!("max_turns:  {}", config.default_max_turns));
     lines.push(format!("timeout:    {}s", config.default_timeout_secs));
-    match base_url {
-        Some(ref u) => lines.push(format!("BASE_URL:   {}", u)),
-        None => lines.push("BASE_URL:   (not set) ⚠".to_string()),
-    }
-    match model {
-        Some(ref m) => lines.push(format!("MODEL:      {}", m)),
-        None => lines.push("MODEL:      (not set) ⚠".to_string()),
-    }
-    match api_key_set {
-        Some(true) => lines.push("API_KEY:    ✓ (set)".to_string()),
-        Some(false) => lines.push("API_KEY:    (empty) ⚠".to_string()),
-        None => lines.push("API_KEY:    (not set) — OK for local servers".to_string()),
-    }
     lines.join("\n")
-}
-
-fn truncate_for_error(text: &[u8], max: usize) -> String {
-    let s = String::from_utf8_lossy(text).replace('\n', "\\n");
-    if s.len() > max {
-        format!("{}...", &s[..max])
-    } else {
-        s
-    }
-}
-
-fn run_fastcontext(config: &Config, args: ExploreArgs) -> Result<String> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to create tokio runtime")?;
-    rt.block_on(run_fastcontext_async(config, args))
-}
-
-async fn run_fastcontext_async(config: &Config, args: ExploreArgs) -> Result<String> {
-    let query = args.query.trim();
-    if query.is_empty() {
-        bail!("query cannot be empty");
-    }
-    if query.len() > 8000 {
-        bail!("query is too long; keep it focused");
-    }
-
-    let work_dir = config.resolve_work_dir(args.work_dir.as_deref())?;
-    let max_turns = args
-        .max_turns
-        .unwrap_or(config.default_max_turns)
-        .clamp(1, 20);
-    let citation = args.citation.unwrap_or(true);
-    let timeout_secs = args
-        .timeout_secs
-        .unwrap_or(config.default_timeout_secs)
-        .clamp(10, 1800);
-    let trajectory_rel = validate_relative_path(
-        args.trajectory_file
-            .as_deref()
-            .unwrap_or(".fastcontext/trajectory.jsonl"),
-    )?;
-
-    if let Some(parent) = trajectory_rel.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(work_dir.join(parent))?;
-        }
-    }
-
-    let mut cmd = Command::new(&config.fastcontext_bin);
-    cmd.kill_on_drop(true)
-        .current_dir(&work_dir)
-        .arg("--query")
-        .arg(query)
-        .arg("--max-turns")
-        .arg(max_turns.to_string())
-        .arg("--traj")
-        .arg(&trajectory_rel)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if citation {
-        cmd.arg("--citation");
-    }
-    if args.verbose.unwrap_or(false) {
-        cmd.arg("--verbose");
-    }
-
-    // Pass per-request endpoint overrides as environment variables.
-    // fastcontext CLI reads BASE_URL, MODEL, API_KEY from its own environment.
-    if let Some(ref url) = args.base_url {
-        if !url.is_empty() {
-            cmd.env("BASE_URL", url);
-        }
-    }
-    if let Some(ref model) = args.model {
-        if !model.is_empty() {
-            cmd.env("MODEL", model);
-        }
-    }
-    if let Some(ref key) = args.api_key {
-        if !key.is_empty() {
-            cmd.env("API_KEY", key);
-        }
-    }
-
-    let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
-        .await
-        .map_err(|_| anyhow!("fastcontext timed out after {timeout_secs}s"))?
-        .with_context(|| {
-            format!(
-                "failed to spawn or wait for FastContext CLI: {}",
-                config.fastcontext_bin
-            )
-        })?;
-
-    if !output.status.success() {
-        bail!(
-            "fastcontext failed with status {}. stderr={}",
-            output.status,
-            truncate_for_error(&output.stderr, 2000)
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        bail!("fastcontext returned empty output");
-    }
-
-    Ok(stdout)
 }
 
 fn handle_tools_call(config: &Config, params: Option<Value>) -> Value {
@@ -411,17 +674,20 @@ fn handle_tools_call(config: &Config, params: Option<Value>) -> Value {
                 }
             };
 
-            match run_fastcontext(config, args) {
-                Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
+            match run_explorer(config, args) {
+                Ok(text) => {
+                    json!({"content": [{"type": "text", "text": text}], "isError": false})
+                }
                 Err(err) => {
                     let msg = err.to_string();
-                    // Improve error message for common "binary not found" case
-                    let enriched = if msg.contains("program not found")
-                        || msg.contains("No such file")
-                        || msg.to_lowercase().contains("cannot find")
+                    // Enrich connection errors
+                    let enriched = if msg.contains("LLM API request failed")
+                        || msg.contains("Connection refused")
                     {
                         format!(
-                            "{}\n\nHint: Install fastcontext CLI: uv tool install . from https://github.com/microsoft/fastcontext\nOr set FASTCONTEXT_BIN env var to the correct path.",
+                            "{}\n\nHint: Make sure your FastContext model server is running.\n\
+                             Start it with: scripts/run_llama_fastcontext_rl.ps1\n\
+                             Or set BASE_URL to point to your running server.",
                             msg
                         )
                     } else {
@@ -479,37 +745,22 @@ fn handle_request(config: &Config, req: JsonRpcRequest) -> Option<Value> {
     Some(response(id, result))
 }
 
+// ============================================================
+// Entrypoint
+// ============================================================
+
 fn main() -> Result<()> {
     let config = Config::from_env()?;
     let stdin = io::stdin();
 
     // Startup diagnostics
-    let (bin_ok, bin_detail) = check_fastcontext_binary(&config.fastcontext_bin);
-    let bin_status = if bin_ok { "✓" } else { "✗ NOT FOUND" };
-    let base_url_status = match env::var("BASE_URL") {
-        Ok(ref u) if !u.is_empty() => format!("✓ ({u})"),
-        _ => "⚠ NOT SET — fastcontext will fail".to_string(),
-    };
-    let model_status = match env::var("MODEL") {
-        Ok(ref m) if !m.is_empty() => format!("✓ ({m})"),
-        _ => "⚠ NOT SET — fastcontext will fail".to_string(),
-    };
-
     eprintln!("{SERVER_NAME} v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("  binary:     {} {}", config.fastcontext_bin, bin_status);
-    if !bin_ok {
-        eprintln!("  binary_detail: {}", bin_detail);
-        eprintln!("  HINT: Install fastcontext CLI or set FASTCONTEXT_BIN");
-    }
-    eprintln!("  BASE_URL:   {}", base_url_status);
-    eprintln!("  MODEL:      {}", model_status);
+    eprintln!("  base_url:   {}", config.base_url);
+    eprintln!("  model:      {}", config.model);
     eprintln!("  work_dir:   {}", config.default_work_dir.display());
     eprintln!("  allowed:    {}", config.allowed_root.display());
     eprintln!("  max_turns:  {}", config.default_max_turns);
     eprintln!("  timeout:    {}s", config.default_timeout_secs);
-    if !bin_ok {
-        eprintln!("WARNING: fastcontext binary not found. Tool calls will fail until installed.");
-    }
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -533,14 +784,19 @@ fn main() -> Result<()> {
     Err(anyhow!("stdin closed"))
 }
 
+// ============================================================
+// Tests
+// ============================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn test_config() -> Config {
         Config {
-            fastcontext_bin: "fastcontext".to_string(),
+            base_url: "http://127.0.0.1:30000/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
             default_work_dir: PathBuf::from("."),
             allowed_root: PathBuf::from("."),
             default_max_turns: 6,
@@ -548,71 +804,115 @@ mod tests {
         }
     }
 
-    // -- validate_relative_path --
+    // -- Config::from_env relies on env vars; tested via manual construction
+
+    // -- Config::resolve_work_dir --
 
     #[test]
-    fn test_validate_relative_path_valid_simple() {
-        let result = validate_relative_path("file.jsonl");
+    fn test_resolve_work_dir_default() {
+        let config = test_config();
+        let result = config.resolve_work_dir(None);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_validate_relative_path_valid_nested() {
-        let result = validate_relative_path("a/b/c.jsonl");
+    fn test_resolve_work_dir_outside_allowed() {
+        let config = test_config();
+        let result = config.resolve_work_dir(Some("C:\\Windows\\System32"));
+        assert!(result.is_err());
+    }
+
+    // -- sanitize_path --
+
+    #[test]
+    fn test_sanitize_path_valid() {
+        let wd = PathBuf::from("/repo");
+        let result = sanitize_path(&wd, "src/main.rs");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("a/b/c.jsonl"));
+        assert_eq!(result.unwrap(), wd.join("src/main.rs"));
     }
 
     #[test]
-    fn test_validate_relative_path_rejects_absolute() {
-        let result = validate_relative_path("/etc/passwd");
+    fn test_sanitize_path_rejects_absolute() {
+        let wd = PathBuf::from("/repo");
+        assert!(sanitize_path(&wd, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_path_rejects_parent() {
+        let wd = PathBuf::from("/repo");
+        assert!(sanitize_path(&wd, "../outside").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_path_rejects_deep_parent() {
+        let wd = PathBuf::from("/repo");
+        assert!(sanitize_path(&wd, "a/b/../../../../etc/passwd").is_err());
+    }
+
+    // -- tool_read --
+
+    #[test]
+    fn test_tool_read_nonexistent_file() {
+        let wd = PathBuf::from(".");
+        let result = tool_read(&wd, "this_file_does_not_exist_42xyz.rs");
         assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("work_dir") || msg.contains("relative") || msg.contains("outside"));
+    }
+
+    // -- tool_glob --
+
+    #[test]
+    fn test_tool_glob_no_match() {
+        let wd = PathBuf::from(".");
+        let result = tool_glob(&wd, "**/*.nonexistent_xyz").unwrap();
+        assert!(result.contains("no files matched"));
     }
 
     #[test]
-    fn test_validate_relative_path_rejects_parent_dir() {
-        let result = validate_relative_path("../escape.txt");
+    fn test_tool_glob_finds_cargo_toml() {
+        let wd = PathBuf::from(".");
+        let result = tool_glob(&wd, "Cargo.toml").unwrap();
+        assert!(result.contains("Cargo.toml"));
+    }
+
+    // -- tool_grep --
+
+    #[test]
+    fn test_tool_grep_no_match() {
+        let wd = PathBuf::from(".");
+        let result = tool_grep(&wd, "nothing", Some("*.nonexistent_ext_xyz")).unwrap();
+        assert!(result.contains("no matches"));
+    }
+
+    #[test]
+    fn test_tool_grep_finds_existing_content() {
+        let wd = PathBuf::from(".");
+        // This file should contain "fastcontext_explore"
+        let result = tool_grep(&wd, "fastcontext_explore", Some("*.rs")).unwrap();
+        assert!(result.contains("fastcontext_explore"));
+    }
+
+    // -- execute_tool --
+
+    #[test]
+    fn test_execute_tool_unknown() {
+        let wd = PathBuf::from(".");
+        let result = execute_tool(&wd, "nonexistent_tool", &json!({}));
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_validate_relative_path_rejects_root() {
-        let result = validate_relative_path("/");
+    fn test_execute_tool_read_missing_arg() {
+        let wd = PathBuf::from(".");
+        let result = execute_tool(&wd, "read", &json!({}));
         assert!(result.is_err());
     }
 
-    // -- truncate_for_error --
-
     #[test]
-    fn test_truncate_short_text_unchanged() {
-        let result = truncate_for_error(b"hello", 100);
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_truncate_long_text() {
-        let result = truncate_for_error(b"hello world", 5);
-        assert_eq!(result, "hello...");
-    }
-
-    #[test]
-    fn test_truncate_newlines_converted() {
-        let result = truncate_for_error(b"line1\nline2", 100);
-        assert_eq!(result, "line1\\nline2");
-    }
-
-    #[test]
-    fn test_truncate_empty() {
-        let result = truncate_for_error(b"", 10);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_truncate_exact_boundary() {
-        let result = truncate_for_error(b"abcde", 5);
-        assert_eq!(result, "abcde");
+    fn test_execute_tool_glob_missing_arg() {
+        let wd = PathBuf::from(".");
+        let result = execute_tool(&wd, "glob", &json!({}));
+        assert!(result.is_err());
     }
 
     // -- tools_list_result --
@@ -689,10 +989,7 @@ mod tests {
             "query": "find routes",
             "work_dir": "/repo",
             "max_turns": 10,
-            "citation": false,
-            "trajectory_file": "traj.jsonl",
             "timeout_secs": 120,
-            "verbose": true,
             "base_url": "http://localhost:8080/v1",
             "model": "my-model",
             "api_key": "sk-test"
@@ -701,7 +998,6 @@ mod tests {
         assert_eq!(args.query, "find routes");
         assert_eq!(args.work_dir.unwrap(), "/repo");
         assert_eq!(args.max_turns.unwrap(), 10);
-        assert!(!args.citation.unwrap());
         assert_eq!(args.base_url.unwrap(), "http://localhost:8080/v1");
         assert_eq!(args.model.unwrap(), "my-model");
         assert_eq!(args.api_key.unwrap(), "sk-test");
@@ -714,7 +1010,13 @@ mod tests {
         assert_eq!(args.query, "search");
         assert!(args.work_dir.is_none());
         assert!(args.max_turns.is_none());
-        assert!(args.citation.is_none());
+    }
+
+    #[test]
+    fn test_explore_args_rejects_empty_query() {
+        let json = json!({"query": ""});
+        let args: ExploreArgs = serde_json::from_value(json).unwrap();
+        assert!(args.query.is_empty());
     }
 
     // -- JSON-RPC request handling --
@@ -804,8 +1106,6 @@ mod tests {
         assert!(result.is_some());
     }
 
-    // -- Config::resolve_work_dir --
-
     // -- server_status_text --
 
     #[test]
@@ -813,53 +1113,42 @@ mod tests {
         let cfg = test_config();
         let report = server_status_text(&cfg);
         assert!(report.contains("fastcontext-mcp-rust"));
-        assert!(report.contains("BASE_URL"));
-        assert!(report.contains("MODEL"));
-        assert!(report.contains("binary"));
+        assert!(report.contains("base_url"));
+        assert!(report.contains("model"));
     }
 
     #[test]
     fn test_server_status_text_contains_config_values() {
         let cfg = test_config();
         let report = server_status_text(&cfg);
-        assert!(report.contains("fastcontext")); // binary name
+        assert!(report.contains("http://127.0.0.1:30000/v1"));
+        assert!(report.contains("test-model"));
         assert!(report.contains("max_turns"));
         assert!(report.contains("timeout"));
     }
 
-    // -- check_fastcontext_binary --
-
+    // -- system_prompt -- (no assert, just ensure no panic)
     #[test]
-    fn test_check_binary_nonexistent_returns_false() {
-        let (found, _detail) = check_fastcontext_binary("this-binary-does-not-exist-hopefully");
-        assert!(!found);
+    fn test_system_prompt_contains_rules() {
+        let prompt = system_prompt("/repo");
+        assert!(prompt.contains("read"));
+        assert!(prompt.contains("glob"));
+        assert!(prompt.contains("grep"));
+        assert!(prompt.contains("/repo"));
     }
 
+    // -- tools_definitions --
     #[test]
-    fn test_resolve_work_dir_default() {
-        let config = Config {
-            fastcontext_bin: "fastcontext".to_string(),
-            default_work_dir: PathBuf::from("."),
-            allowed_root: PathBuf::from("."),
-            default_max_turns: 6,
-            default_timeout_secs: 300,
-        };
-        let result = config.resolve_work_dir(None);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_resolve_work_dir_outside_allowed() {
-        // Use temp dir outside cwd as disallowed path
-        let config = Config {
-            fastcontext_bin: "fastcontext".to_string(),
-            default_work_dir: PathBuf::from("."),
-            allowed_root: PathBuf::from("."),
-            default_max_turns: 6,
-            default_timeout_secs: 300,
-        };
-        // An absolute path that is unlikely to be under "." canonicalized
-        let result = config.resolve_work_dir(Some("C:\\Windows\\System32"));
-        assert!(result.is_err());
+    fn test_tools_definitions_has_three_tools() {
+        let defs = tools_definitions();
+        let arr = defs.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"glob"));
+        assert!(names.contains(&"grep"));
     }
 }

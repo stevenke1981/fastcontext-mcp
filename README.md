@@ -5,15 +5,14 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](rust-toolchain.toml)
 ![GitHub last commit](https://img.shields.io/github/last-commit/stevenke1981/fastcontext-mcp)
 
-Local MCP stdio server written in Rust. It wraps the upstream `fastcontext` CLI and points it at a local OpenAI-compatible model server running `microsoft/FastContext-1.0-4B-RL`.
+Local MCP stdio server written in Rust with a **built-in LLM agent loop**. It communicates directly with a local FastContext model (via OpenAI Chat Completions API) using Read/Glob/Grep tools for repository exploration — no external CLI dependencies.
 
 ## Table of Contents
 
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
   - [1. Run the model locally](#1-run-the-model-locally)
-  - [2. Install FastContext CLI](#2-install-fastcontext-cli)
-  - [3. Build MCP server](#3-build-mcp-server)
+  - [2. Build MCP server](#2-build-mcp-server)
   - [4. OpenCode config](#4-opencode-config)
 - [Tools](#tools)
   - [`fastcontext_explore`](#fastcontext_explore)
@@ -26,8 +25,7 @@ Local MCP stdio server written in Rust. It wraps the upstream `fastcontext` CLI 
 
 ```text
 OpenCode / MCP client
-  -> fastcontext-mcp-rust over stdio
-  -> fastcontext CLI
+  -> fastcontext-mcp-rust over stdio (agent loop + read/glob/grep tools)
   -> http://127.0.0.1:30000/v1/chat/completions
   -> microsoft/FastContext-1.0-4B-RL
        Option A: SGLang/vLLM (BF16, full precision)
@@ -68,21 +66,7 @@ Windows PowerShell:
 
 The script auto-downloads the GGUF model (`mitkox/FastContext-1.0-4B-RL-Q4_K_M-GGUF`, ~2.5 GB) from HuggingFace on first run. Reduce context with `--ctx-size 65536` if memory constrained.
 
-### 2. Install FastContext CLI
-
-```bash
-git clone https://github.com/microsoft/fastcontext.git
-cd fastcontext
-uv tool install .
-```
-
-Check:
-
-```bash
-fastcontext --query "Locate request validation logic" --citation
-```
-
-### 3. Build MCP server
+### 2. Build MCP server
 
 ```bash
 cargo build --release
@@ -141,7 +125,7 @@ The optional `base_url`, `model`, and `api_key` fields override the correspondin
 
 ### `fastcontext_status`
 
-Diagnostic tool — returns server configuration, `fastcontext` binary availability, environment variable status, and default settings.
+Diagnostic tool — returns server configuration, LLM endpoint settings, and default parameters.
 
 ```json
 {
@@ -154,21 +138,19 @@ Response example:
 
 ```
 server:     fastcontext-mcp-rust v0.1.0
-binary:     fastcontext ✓
+base_url:   http://127.0.0.1:30000/v1
+model:      microsoft/FastContext-1.0-4B-RL
+api_key:    ✓ (set)
 work_dir:   D:\repo
 allowed_root: D:\repo
 max_turns:  6
 timeout:    300s
-BASE_URL:   http://127.0.0.1:30000/v1
-MODEL:      microsoft/FastContext-1.0-4B-RL
-API_KEY:    ✓ (set)
 ```
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FASTCONTEXT_BIN` | `fastcontext` | Path to the FastContext CLI binary |
 | `FASTCONTEXT_WORK_DIR` | current directory | Default repository work directory |
 | `FASTCONTEXT_ALLOWED_ROOT` | same as work dir | Directory root for `work_dir` validation |
 | `FASTCONTEXT_MAX_TURNS` | `6` | Default max exploration turns |
@@ -181,7 +163,7 @@ The tool arguments `base_url`, `model`, `api_key` override the corresponding env
 
 ## Development
 
-Prerequisites: [Rust](https://rustup.rs/) (stable), `fastcontext` CLI.
+Prerequisites: [Rust](https://rustup.rs/) (stable).
 
 ```bash
 # Check code
@@ -201,4 +183,4 @@ CI runs these checks automatically on push/PR via GitHub Actions (see [ci.yml](.
 
 ## Security notes
 
-This wrapper is intentionally read-only. It only exposes FastContext exploration and does not expose shell execution, file writing, git, cargo, or arbitrary commands. `work_dir` must stay inside `FASTCONTEXT_ALLOWED_ROOT`; `trajectory_file` must be a relative path under the repository.
+This server is intentionally read-only. It only exposes FastContext exploration via the built-in agent loop and does not provide shell execution, file writing, git, cargo, or arbitrary commands. `work_dir` must stay inside `FASTCONTEXT_ALLOWED_ROOT`. All file paths in Read/Glob/Grep are sanitized against path traversal.
