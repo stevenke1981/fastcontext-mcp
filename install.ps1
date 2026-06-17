@@ -12,12 +12,12 @@
 
 param(
     [switch] $NoBuild,
-    [string] $Prefix = "$env:USERPROFILE\.cargo\bin"
+    [string] $Prefix = "$env:USERPROFILE\.config\fastcontext\bin"
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSCommandPath
-$ConfigDir = "$env:USERPROFILE\.config\fastcontext-mcp"
+$ConfigDir = "$env:USERPROFILE\.config\fastcontext"
 
 Write-Host "=== fastcontext-mcp-rust installer ===`n" -ForegroundColor Cyan
 

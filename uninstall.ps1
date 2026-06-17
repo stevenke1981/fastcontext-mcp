@@ -8,11 +8,11 @@
 #>
 
 param(
-    [string] $Prefix = "$env:USERPROFILE\.cargo\bin"
+    [string] $Prefix = "$env:USERPROFILE\.config\fastcontext\bin"
 )
 
 $ErrorActionPreference = "Stop"
-$ConfigDir = "$env:USERPROFILE\.config\fastcontext-mcp"
+$ConfigDir = "$env:USERPROFILE\.config\fastcontext"
 
 Write-Host "=== fastcontext-mcp-rust uninstaller ===`n" -ForegroundColor Cyan
 

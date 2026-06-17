@@ -8,8 +8,8 @@
 #
 set -euo pipefail
 
-PREFIX="${PREFIX:-"$HOME/.cargo/bin"}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fastcontext-mcp"
+PREFIX="${PREFIX:-"$HOME/.config/fastcontext/bin"}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fastcontext"
 
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'

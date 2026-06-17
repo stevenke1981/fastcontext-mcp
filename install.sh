@@ -10,8 +10,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
-PREFIX="${PREFIX:-"$HOME/.cargo/bin"}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fastcontext-mcp"
+PREFIX="${PREFIX:-"$HOME/.config/fastcontext/bin"}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fastcontext"
 
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
