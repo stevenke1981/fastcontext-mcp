@@ -9,7 +9,9 @@ OpenCode / MCP client
   -> fastcontext-mcp-rust over stdio
   -> fastcontext CLI
   -> http://127.0.0.1:30000/v1/chat/completions
-  -> microsoft/FastContext-1.0-4B-RL served by SGLang/vLLM
+  -> microsoft/FastContext-1.0-4B-RL
+       Option A: SGLang/vLLM (BF16, full precision)
+       Option B: llama.cpp   (GGUF Q4_K_M, 2.5 GB, no Python needed)
 ```
 
 ## 1. Run the model locally
@@ -27,6 +29,22 @@ Windows PowerShell:
 pip install "sglang[all]"
 ./scripts/run_sglang_fastcontext_rl.ps1
 ```
+
+**llama.cpp** (GGUF, no Python runtime required):
+
+Install [llama.cpp](https://github.com/ggml-org/llama.cpp) (build from source or use a release binary), then:
+
+```bash
+./scripts/run_llama_fastcontext_rl.sh
+```
+
+Windows PowerShell:
+
+```powershell
+./scripts/run_llama_fastcontext_rl.ps1
+```
+
+The script auto-downloads the GGUF model (`mitkox/FastContext-1.0-4B-RL-Q4_K_M-GGUF`, ~2.5 GB) from HuggingFace on first run. Reduce context with `--ctx-size 65536` if memory constrained.
 
 ## 2. Install FastContext CLI
 
